@@ -8,12 +8,13 @@ import (
 )
 
 // 记录帧格式（格式版本 1）：
-//   magic   uint32 固定魔数，用于识别帧边界与错位数据
-//   version uint16 记录格式版本
-//   flags   uint16 保留
-//   length  uint32 payload 字节数
-//   crc32   uint32 payload 的 CRC32(IEEE)
-//   payload []byte
+//
+//	magic   uint32 固定魔数，用于识别帧边界与错位数据
+//	version uint16 记录格式版本
+//	flags   uint16 保留
+//	length  uint32 payload 字节数
+//	crc32   uint32 payload 的 CRC32(IEEE)
+//	payload []byte
 const (
 	recordMagic     uint32 = 0x4C4F4731 // "LOG1"
 	recordVersionV1 uint16 = 1
