@@ -135,9 +135,10 @@ func (l *Log) findSegmentLocked(offset uint64) *segment {
 
 // acquireSegment 定位 offset 所在段并增加其读取引用计数，
 // 使并发 Trim 能识别"读取进行中"并明确拒绝回收。
+// 引用计数是共享状态，必须在写锁下修改。
 func (l *Log) acquireSegment(offset uint64) (*segment, error) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closed {
 		return nil, ErrClosed
 	}
@@ -175,24 +176,24 @@ func (l *Log) ReadAt(offset uint64) (Record, error) {
 // offset 等于 NextOffset（空区间）时立即返回 nil。
 func (l *Log) Replay(offset uint64, fn func(Record) error) error {
 	for {
-		l.mu.RLock()
+		l.mu.Lock()
 		if l.closed {
-			l.mu.RUnlock()
+			l.mu.Unlock()
 			return ErrClosed
 		}
 		end := l.nextOffsetLocked()
 		if offset == end {
-			l.mu.RUnlock()
+			l.mu.Unlock()
 			return nil
 		}
 		seg := l.findSegmentLocked(offset)
 		if seg == nil {
-			l.mu.RUnlock()
+			l.mu.Unlock()
 			return fmt.Errorf("%w: offset %d, valid end %d",
 				ErrOffsetOutOfRange, offset, end)
 		}
 		seg.refs++
-		l.mu.RUnlock()
+		l.mu.Unlock()
 
 		payload, total, err := readRecordAt(seg.file, int64(offset-seg.base))
 		l.releaseSegment(seg)
