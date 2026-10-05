@@ -121,6 +121,9 @@ func (s *Store) Compact(ctx context.Context, opts CompactOptions) (CompactResult
 	if err := s.persistMetaLocked(); err != nil {
 		return result, s.markUnhealthyLocked("persisting metadata after compaction", err)
 	}
+	// Wake blocked cursor readers: a lagging cursor whose position was just
+	// reclaimed must observe ErrPositionReclaimed, not wait forever.
+	s.broadcastLocked()
 	result.ReclaimedBytes += s.reclaimZero() // no-op keeps intent explicit
 	s.lastRecovery.decideCompaction(result)
 	return result, nil

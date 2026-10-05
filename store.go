@@ -79,6 +79,14 @@ type Store struct {
 
 	lastRecovery *RecoveryReport
 
+	// changeCh is closed and replaced on every committed append, compaction
+	// and Close, so blocked cursor readers wake up without polling.
+	changeCh chan struct{}
+
+	// cmu guards cursors, the registry of cursors open in this process.
+	cmu     sync.Mutex
+	cursors map[string]*Cursor
+
 	// testCompactHook, if set, runs after the compaction gate is acquired.
 	testCompactHook func()
 }
@@ -128,6 +136,8 @@ func newEmptyStore(dir string, opts Options, report *RecoveryReport) (*Store, er
 		nextSequence: 0,
 		frameStarts:  map[uint64][]uint64{0: {}},
 		lastRecovery: report,
+		changeCh:     make(chan struct{}),
+		cursors:      make(map[string]*Cursor),
 	}
 	sg := &segment{base: 0, dataStart: 0, path: path, size: segmentHeaderSize, file: f}
 	s.segments = []*segment{sg}
@@ -143,6 +153,8 @@ func buildRecoveredStore(
 		dir:         dir,
 		opts:        opts,
 		frameStarts: make(map[uint64][]uint64),
+		changeCh:    make(chan struct{}),
+		cursors:     make(map[string]*Cursor),
 	}
 	for _, sc := range scans {
 		path := segmentPath(dir, sc.base)
@@ -248,6 +260,20 @@ func (s *Store) physicalBytesLocked() int64 {
 	return n
 }
 
+// broadcastLocked wakes every blocked cursor reader. Callers must hold mu.
+func (s *Store) broadcastLocked() {
+	close(s.changeCh)
+	s.changeCh = make(chan struct{})
+}
+
+// change returns the current generation channel; it is closed on the next
+// committed append, compaction or Close.
+func (s *Store) change() <-chan struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.changeCh
+}
+
 // markUnhealthyLocked is called after an I/O failure whose on-disk result is
 // uncertain. The store refuses all further writes until reopened, so a torn
 // frame can never be followed by a good one as if nothing happened.
@@ -319,6 +345,7 @@ func (s *Store) Append(ctx context.Context, data []byte) (Position, error) {
 		// unhealthy so the ambiguity is explicit until reopen.
 		return Position(pos), s.markUnhealthyLocked("persisting metadata after durable frame", err)
 	}
+	s.broadcastLocked()
 	return Position(pos), nil
 }
 
@@ -544,6 +571,7 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.broadcastLocked() // wake blocked cursor readers so they see ErrClosed
 	if s.active != nil && s.active.file != nil {
 		err := s.active.file.Close()
 		s.active.file = nil
