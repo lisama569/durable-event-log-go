@@ -56,6 +56,16 @@ func (s *Store) Compact(ctx context.Context, opts CompactOptions) (CompactResult
 	if err != nil {
 		return CompactResult{}, err
 	}
+	// Retention floor imposed by registered cursor consumers: compaction is
+	// clamped rather than allowed to silently delete unconsumed data. The
+	// floor is advisory (the Manager enforces it by attaching a guard); a
+	// detached Manager imposes nothing.
+	if s.guard != nil {
+		if floor, ok := s.guard.retentionFloor(); ok && uint64(floor) < cutoff {
+			cutoff = uint64(floor)
+			s.lastRecovery.decide("compaction: cutoff clamped to cursor retention floor %s", floor)
+		}
+	}
 	if cutoff == 0 {
 		return CompactResult{}, nil
 	}
@@ -123,6 +133,9 @@ func (s *Store) Compact(ctx context.Context, opts CompactOptions) (CompactResult
 	}
 	result.ReclaimedBytes += s.reclaimZero() // no-op keeps intent explicit
 	s.lastRecovery.decideCompaction(result)
+	// Compaction moved the retention horizon: wake parked consumers so they
+	// re-check and either resume or fail loudly with ErrCursorPositionReclaimed.
+	s.hub.notify()
 	return result, nil
 }
 

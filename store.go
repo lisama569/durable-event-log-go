@@ -68,8 +68,8 @@ type Store struct {
 
 	segments []*segment // sorted by base; last element is active
 	active   *segment
-	writePos uint64    // logical end offset (== active.end())
-	startPos uint64    // base of the oldest surviving segment
+	writePos uint64 // logical end offset (== active.end())
+	startPos uint64 // base of the oldest surviving segment
 
 	nextSequence uint64
 
@@ -78,6 +78,12 @@ type Store struct {
 	frameStarts map[uint64][]uint64
 
 	lastRecovery *RecoveryReport
+
+	// hub wakes consumers parked at the committed end (edge-triggered).
+	hub *waiterHub
+	// guard, when set (by a cursor Manager), clamps compaction so no position
+	// a known cursor still needs is reclaimed.
+	guard retentionGuard
 
 	// testCompactHook, if set, runs after the compaction gate is acquired.
 	testCompactHook func()
@@ -128,6 +134,7 @@ func newEmptyStore(dir string, opts Options, report *RecoveryReport) (*Store, er
 		nextSequence: 0,
 		frameStarts:  map[uint64][]uint64{0: {}},
 		lastRecovery: report,
+		hub:          newWaiterHub(),
 	}
 	sg := &segment{base: 0, dataStart: 0, path: path, size: segmentHeaderSize, file: f}
 	s.segments = []*segment{sg}
@@ -143,6 +150,7 @@ func buildRecoveredStore(
 		dir:         dir,
 		opts:        opts,
 		frameStarts: make(map[uint64][]uint64),
+		hub:         newWaiterHub(),
 	}
 	for _, sc := range scans {
 		path := segmentPath(dir, sc.base)
@@ -317,8 +325,12 @@ func (s *Store) Append(ctx context.Context, data []byte) (Position, error) {
 	if err := s.persistMetaLocked(); err != nil {
 		// Data is already durable; only the rebuildable sidecar failed. Go
 		// unhealthy so the ambiguity is explicit until reopen.
+		s.hub.notify()
 		return Position(pos), s.markUnhealthyLocked("persisting metadata after durable frame", err)
 	}
+	// Wake every consumer parked at the committed end. Edge-triggered: the
+	// record above is durable and visible before the channels close.
+	s.hub.notify()
 	return Position(pos), nil
 }
 
@@ -405,7 +417,9 @@ func readFrameAt(f *os.File, physical int64) (frame, int64, error) {
 	return fr, int64(n), err
 }
 
-func be32(b []byte) uint32 { return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]) }
+func be32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
 
 // Read returns the record exactly at pos. A position inside a frame is
 // ErrOffsetNotAligned; a compacted position is ErrPositionReclaimed; reading
@@ -544,6 +558,8 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	// Wake parked cursor handlers; they must not block forever on a closed store.
+	s.hub.notify()
 	if s.active != nil && s.active.file != nil {
 		err := s.active.file.Close()
 		s.active.file = nil
